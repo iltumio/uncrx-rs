@@ -1,7 +1,7 @@
 # Uncrx-rs
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Crates.io Version](https://img.shields.io/crates/v/uncrx-rs)
+[![Crates.io Version](https://img.shields.io/crates/v/uncrx-rs)](https://crates.io/crates/uncrx-rs)
 
 ## Description
 
