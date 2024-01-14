@@ -1,0 +1,8 @@
+[package]
+name = "uncrx-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.79"
+infer = "0.15.0"
