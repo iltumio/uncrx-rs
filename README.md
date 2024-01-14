@@ -25,7 +25,7 @@ cargo add uncrx-rs
 ```rust
 // Open the CRX extension
 let current_dir = env::current_dir().expect("Failed to get current directory");
-let file_path = current_dir.join("src/test/metamask.crx");
+let file_path = current_dir.join("src/mock/test-extension.crx");
 let data = fs::read(file_path.to_str().unwrap()).expect("Failed to read file");
 
 // Parse the extension
