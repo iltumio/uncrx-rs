@@ -1,6 +1,6 @@
 [package]
 name = "uncrx-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Uncrx is a library that helps you convert a CRX Extension to a zip file that can be easily extracted."
 readme = "README.md"
