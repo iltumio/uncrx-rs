@@ -14,9 +14,42 @@ use ratatui::{
 use std::{
     env, fs,
     io::{self, Stdout},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use uncrx_rs::uncrx::helpers::parse_crx;
+use zip::ZipArchive;
+
+fn extract_zip_to_directory(
+    zip_data: &[u8],
+    extract_to: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cursor = std::io::Cursor::new(zip_data);
+    let mut archive = ZipArchive::new(cursor)?;
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i)?;
+        let outpath = match file.enclosed_name() {
+            Some(path) => extract_to.join(path),
+            None => continue,
+        };
+
+        if file.name().ends_with('/') {
+            // Directory
+            fs::create_dir_all(&outpath)?;
+        } else {
+            // File
+            if let Some(p) = outpath.parent() {
+                if !p.exists() {
+                    fs::create_dir_all(p)?;
+                }
+            }
+            let mut outfile = fs::File::create(&outpath)?;
+            std::io::copy(&mut file, &mut outfile)?;
+        }
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 enum AppState {
@@ -26,11 +59,42 @@ enum AppState {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+enum FileSystemItem {
+    Directory(PathBuf),
+    CrxFile(PathBuf),
+    ParentDirectory,
+}
+
+impl FileSystemItem {
+    fn name(&self) -> String {
+        match self {
+            FileSystemItem::Directory(path) => {
+                format!(
+                    "📁 {}/",
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                )
+            }
+            FileSystemItem::CrxFile(path) => {
+                format!(
+                    "📄 {}",
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                )
+            }
+            FileSystemItem::ParentDirectory => "📁 ../".to_string(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct App {
     state: AppState,
-    files: Vec<PathBuf>,
-    selected_file: ListState,
+    items: Vec<FileSystemItem>,
+    selected_item: ListState,
     current_dir: PathBuf,
     output_dir: PathBuf,
 }
@@ -42,48 +106,76 @@ impl App {
 
         let mut app = App {
             state: AppState::FileBrowser,
-            files: Vec::new(),
-            selected_file: ListState::default(),
+            items: Vec::new(),
+            selected_item: ListState::default(),
             current_dir: current_dir.clone(),
             output_dir,
         };
 
-        app.refresh_files()?;
-        if !app.files.is_empty() {
-            app.selected_file.select(Some(0));
+        app.refresh_items()?;
+        if !app.items.is_empty() {
+            app.selected_item.select(Some(0));
         }
 
         Ok(app)
     }
 
-    fn refresh_files(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.files.clear();
+    fn refresh_items(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.items.clear();
+
+        // Add parent directory entry if not at root
+        if self.current_dir.parent().is_some() {
+            self.items.push(FileSystemItem::ParentDirectory);
+        }
+
+        let mut directories = Vec::new();
+        let mut crx_files = Vec::new();
 
         for entry in fs::read_dir(&self.current_dir)? {
             let entry = entry?;
             let path = entry.path();
 
-            if path.is_file() {
+            if path.is_dir() {
+                directories.push(FileSystemItem::Directory(path));
+            } else if path.is_file() {
                 if let Some(extension) = path.extension() {
                     if extension == "crx" {
-                        self.files.push(path);
+                        crx_files.push(FileSystemItem::CrxFile(path));
                     }
                 }
             }
         }
 
-        self.files.sort();
+        // Sort directories and files separately
+        directories.sort_by(|a, b| match (a, b) {
+            (FileSystemItem::Directory(a), FileSystemItem::Directory(b)) => {
+                a.file_name().cmp(&b.file_name())
+            }
+            _ => std::cmp::Ordering::Equal,
+        });
+
+        crx_files.sort_by(|a, b| match (a, b) {
+            (FileSystemItem::CrxFile(a), FileSystemItem::CrxFile(b)) => {
+                a.file_name().cmp(&b.file_name())
+            }
+            _ => std::cmp::Ordering::Equal,
+        });
+
+        // Add directories first, then files
+        self.items.extend(directories);
+        self.items.extend(crx_files);
+
         Ok(())
     }
 
-    fn next_file(&mut self) {
-        if self.files.is_empty() {
+    fn next_item(&mut self) {
+        if self.items.is_empty() {
             return;
         }
 
-        let i = match self.selected_file.selected() {
+        let i = match self.selected_item.selected() {
             Some(i) => {
-                if i >= self.files.len() - 1 {
+                if i >= self.items.len() - 1 {
                     0
                 } else {
                     i + 1
@@ -91,39 +183,53 @@ impl App {
             }
             None => 0,
         };
-        self.selected_file.select(Some(i));
+        self.selected_item.select(Some(i));
     }
 
-    fn previous_file(&mut self) {
-        if self.files.is_empty() {
+    fn previous_item(&mut self) {
+        if self.items.is_empty() {
             return;
         }
 
-        let i = match self.selected_file.selected() {
+        let i = match self.selected_item.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.files.len() - 1
+                    self.items.len() - 1
                 } else {
                     i - 1
                 }
             }
             None => 0,
         };
-        self.selected_file.select(Some(i));
+        self.selected_item.select(Some(i));
     }
 
-    fn convert_selected_file(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(selected) = self.selected_file.selected() {
-            if selected < self.files.len() {
-                let file_path = &self.files[selected];
-                self.state = AppState::Processing;
-
-                match self.convert_crx_file(file_path) {
-                    Ok(output_path) => {
-                        self.state = AppState::Success(output_path);
+    fn handle_enter(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(selected) = self.selected_item.selected() {
+            if selected < self.items.len() {
+                match &self.items[selected] {
+                    FileSystemItem::Directory(path) => {
+                        self.current_dir = path.clone();
+                        self.refresh_items()?;
+                        self.selected_item.select(Some(0));
                     }
-                    Err(e) => {
-                        self.state = AppState::Error(e.to_string());
+                    FileSystemItem::CrxFile(path) => {
+                        self.state = AppState::Processing;
+                        match self.convert_crx_file(path) {
+                            Ok(output_path) => {
+                                self.state = AppState::Success(output_path);
+                            }
+                            Err(e) => {
+                                self.state = AppState::Error(e.to_string());
+                            }
+                        }
+                    }
+                    FileSystemItem::ParentDirectory => {
+                        if let Some(parent) = self.current_dir.parent() {
+                            self.current_dir = parent.to_path_buf();
+                            self.refresh_items()?;
+                            self.selected_item.select(Some(0));
+                        }
                     }
                 }
             }
@@ -144,10 +250,18 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("extension");
 
-        let output_file = self.output_dir.join(format!("{}.zip", file_name));
-        fs::write(&output_file, &extension.zip)?;
+        let extract_dir = self.output_dir.join(file_name);
 
-        Ok(output_file.to_string_lossy().to_string())
+        if extract_dir.exists() {
+            fs::remove_dir_all(&extract_dir)?;
+        }
+
+        fs::create_dir_all(&extract_dir)?;
+
+        // Extract zip contents to the directory
+        extract_zip_to_directory(&extension.zip, &extract_dir)?;
+
+        Ok(extract_dir.to_string_lossy().to_string())
     }
 
     fn reset_to_browser(&mut self) {
@@ -195,13 +309,16 @@ fn run_app(
                 match &app.state {
                     AppState::FileBrowser => match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Down | KeyCode::Char('j') => app.next_file(),
-                        KeyCode::Up | KeyCode::Char('k') => app.previous_file(),
+                        KeyCode::Down | KeyCode::Char('j') => app.next_item(),
+                        KeyCode::Up | KeyCode::Char('k') => app.previous_item(),
                         KeyCode::Enter => {
-                            app.convert_selected_file()?;
+                            app.handle_enter()?;
                         }
                         KeyCode::Char('r') => {
-                            app.refresh_files()?;
+                            app.refresh_items()?;
+                            if !app.items.is_empty() {
+                                app.selected_item.select(Some(0));
+                            }
                         }
                         _ => {}
                     },
@@ -242,7 +359,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     // Footer with instructions
     let instructions = match &app.state {
-        AppState::FileBrowser => "↑/↓: Navigate | Enter: Convert | R: Refresh | Q/Esc: Quit",
+        AppState::FileBrowser => "↑/↓: Navigate | Enter: Open/Extract | R: Refresh | Q/Esc: Quit",
         AppState::Processing => "Processing...",
         AppState::Success(_) | AppState::Error(_) => {
             "Enter/Space: Back to file browser | Q/Esc: Quit"
@@ -273,49 +390,54 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn render_file_browser(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+    let current_dir_display = app.current_dir.to_string_lossy();
+    let title = format!("File Browser - {}", current_dir_display);
+
     let block = Block::default()
-        .title("CRX Files")
+        .title(title)
         .borders(Borders::ALL)
         .style(Style::default());
 
-    if app.files.is_empty() {
-        let no_files = Paragraph::new("No CRX files found in current directory")
+    if app.items.is_empty() {
+        let no_items = Paragraph::new("No directories or CRX files found in current directory")
             .style(Style::default().fg(Color::Yellow))
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true })
             .block(block);
-        f.render_widget(no_files, area);
+        f.render_widget(no_items, area);
     } else {
         let items: Vec<ListItem> = app
-            .files
+            .items
             .iter()
             .enumerate()
-            .map(|(i, path)| {
-                let filename = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown");
+            .map(|(i, item)| {
+                let display_name = item.name();
 
-                let style = if Some(i) == app.selected_file.selected() {
+                let style = if Some(i) == app.selected_item.selected() {
                     Style::default().fg(Color::Black).bg(Color::White)
                 } else {
-                    Style::default()
+                    match item {
+                        FileSystemItem::Directory(_) | FileSystemItem::ParentDirectory => {
+                            Style::default().fg(Color::Blue)
+                        }
+                        FileSystemItem::CrxFile(_) => Style::default().fg(Color::Green),
+                    }
                 };
 
-                ListItem::new(Line::from(Span::styled(filename, style)))
+                ListItem::new(Line::from(Span::styled(display_name, style)))
             })
             .collect();
 
-        let files_list = List::new(items)
+        let items_list = List::new(items)
             .block(block)
             .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
 
-        f.render_stateful_widget(files_list, area, &mut app.selected_file.clone());
+        f.render_stateful_widget(items_list, area, &mut app.selected_item.clone());
     }
 }
 
 fn render_processing(f: &mut Frame, area: ratatui::layout::Rect) {
-    let processing = Paragraph::new("Converting CRX file to ZIP...\n\nPlease wait...")
+    let processing = Paragraph::new("Extracting CRX file contents...\n\nPlease wait...")
         .style(Style::default().fg(Color::Yellow))
         .alignment(Alignment::Center)
         .block(Block::default().title("Processing").borders(Borders::ALL));
@@ -325,7 +447,7 @@ fn render_processing(f: &mut Frame, area: ratatui::layout::Rect) {
 
 fn render_success(f: &mut Frame, area: ratatui::layout::Rect, output_path: &str) {
     let success_msg = format!(
-        "✓ Conversion successful!\n\nOutput file: {}\n\nPress Enter or Space to continue",
+        "✓ Extraction successful!\n\nExtracted to: {}\n\nPress Enter or Space to continue",
         output_path
     );
 
@@ -340,7 +462,7 @@ fn render_success(f: &mut Frame, area: ratatui::layout::Rect, output_path: &str)
 
 fn render_error(f: &mut Frame, area: ratatui::layout::Rect, error_msg: &str) {
     let error_text = format!(
-        "✗ Error occurred during conversion:\n\n{}\n\nPress Enter or Space to continue",
+        "✗ Error occurred during extraction:\n\n{}\n\nPress Enter or Space to continue",
         error_msg
     );
 
