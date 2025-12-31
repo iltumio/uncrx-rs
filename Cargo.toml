@@ -1,6 +1,6 @@
 [package]
 name = "uncrx-rs"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Uncrx is a library that helps you convert a CRX Extension to a zip file that can be easily extracted."
 readme = "README.md"
@@ -9,7 +9,13 @@ repository = "https://github.com/iltumio/uncrx-rs"
 
 [dependencies]
 anyhow = "1.0.79"
-clap = {version = "4.4.18", features = ["derive"]}
+clap = { version = "4.4.18", features = ["derive"] }
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+zip = "7.0.0"
+
+[dev-dependencies]
+tempfile = "3.8"
 
 [[bin]]
 name = "uncrx"
@@ -20,15 +26,24 @@ path = "src/main.rs"
 inherits = "release"
 lto = "thin"
 
-# Config for 'cargo dist'
+# Config for 'dist'
 [workspace.metadata.dist]
-# The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.8.1"
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.30.3"
 # CI backends to support
-ci = ["github"]
+ci = "github"
 # The installers to generate for each app
 installers = ["shell", "powershell", "homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-# Publish jobs to run in CI
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+# Which actions to run on pull requests
 pr-run-mode = "plan"
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
