@@ -14,8 +14,8 @@ use zip::ZipArchive;
 #[command(about = "Easily convert a CRX Extension to a zip file", long_about = None)]
 #[command(next_line_help = true)]
 struct Cli {
-    /// CRX file to convert (if not provided, TUI mode will launch)
-    filename: Option<String>,
+    /// CRX file to convert
+    filename: String,
     #[arg(short, long)]
     output_dir: Option<String>,
 }
@@ -53,20 +53,18 @@ fn extract_zip_to_directory(
 }
 
 pub fn main() {
-    let cli = Cli::parse();
-
-    // If no filename is provided, launch TUI mode
-    let filename = match cli.filename {
-        Some(file) => file,
-        None => {
-            // Launch TUI mode
-            if let Err(err) = tui_app::run_tui() {
-                eprintln!("TUI Error: {}", err);
-                std::process::exit(1);
-            }
-            return;
+    // If no arguments provided, launch TUI mode
+    if env::args().len() == 1 {
+        if let Err(err) = tui_app::run_tui() {
+            eprintln!("TUI Error: {}", err);
+            std::process::exit(1);
         }
-    };
+        return;
+    }
+
+    // CLI mode - parse arguments and process
+    let cli = Cli::parse();
+    let filename = cli.filename;
 
     // CLI mode - process the provided file
     match filename.ends_with(".crx") {
