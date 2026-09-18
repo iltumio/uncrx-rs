@@ -1,312 +1,292 @@
-use std::{env, fs};
-use tempfile::TempDir;
-use uncrx_rs::uncrx::helpers::parse_crx;
-use zip::ZipArchive;
-
-fn extract_zip_to_directory(
-    zip_data: &[u8],
-    extract_to: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cursor = std::io::Cursor::new(zip_data);
-    let mut archive = ZipArchive::new(cursor)?;
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => extract_to.join(path),
-            None => continue,
-        };
-
-        if file.name().ends_with('/') {
-            // Directory
-            fs::create_dir_all(&outpath)?;
-        } else {
-            // File
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p)?;
-                }
-            }
-            let mut outfile = fs::File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)?;
-        }
-    }
-
-    Ok(())
-}
+#![cfg(feature = "extract")]
+mod common;
+use std::{fs, sync::atomic::AtomicBool, time::Duration};
+use tempfile::tempdir;
+use uncrx_rs::extract::{
+    extract_crx_file, extract_crx_file_cancellable, extract_zip_to_directory, ExtractionOptions,
+};
 
 #[test]
-fn test_end_to_end_crx_extraction() {
-    // Test the complete workflow from CRX file to extracted directory
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-    let file_path = current_dir.join("src/mock/test-extension.crx");
-
-    // Ensure the test file exists
-    assert!(
-        file_path.exists(),
-        "Test CRX file should exist at: {}",
-        file_path.display()
-    );
-
-    // Read and parse the CRX file
-    let data = fs::read(&file_path).expect("Failed to read CRX file");
-    let extension = parse_crx(&data).expect("Failed to parse CRX file");
-
-    // Create temporary extraction directory
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let crx_name = file_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("extension");
-    let extract_dir = temp_dir.path().join(crx_name);
-
-    // Extract the extension
-    extract_zip_to_directory(&extension.zip, &extract_dir).expect("Failed to extract ZIP contents");
-
-    // Verify extraction was successful
-    assert!(extract_dir.exists(), "Extraction directory should exist");
-
-    // Check that we have files in the extraction directory
-    let extracted_entries: Vec<_> = fs::read_dir(&extract_dir)
-        .expect("Should be able to read extraction directory")
-        .collect();
-
-    assert!(
-        !extracted_entries.is_empty(),
-        "Should have extracted at least one file/directory"
-    );
-
-    // Verify the extraction maintains the original ZIP structure
-    let cursor = std::io::Cursor::new(&extension.zip);
-    let archive = ZipArchive::new(cursor).expect("Should be able to read ZIP data");
-
-    println!("ZIP archive contains {} entries", archive.len());
-
-    // Print extracted structure for debugging
-    print_directory_structure(&extract_dir, 0);
-}
-
-#[test]
-fn test_crx_file_produces_valid_extension_structure() {
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-    let file_path = current_dir.join("src/mock/test-extension.crx");
-
-    let data = fs::read(&file_path).expect("Failed to read CRX file");
-    let extension = parse_crx(&data).expect("Failed to parse CRX file");
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let extract_dir = temp_dir.path().join("test-extension");
-
-    extract_zip_to_directory(&extension.zip, &extract_dir).expect("Failed to extract ZIP contents");
-
-    // Check for common Chrome extension files
-    let manifest_path = extract_dir.join("manifest.json");
-
-    if manifest_path.exists() {
-        let manifest_content =
-            fs::read_to_string(&manifest_path).expect("Should be able to read manifest.json");
-
-        // Basic validation that it's a JSON file
-        assert!(!manifest_content.is_empty(), "Manifest should not be empty");
-        assert!(
-            manifest_content.contains("manifest_version")
-                || manifest_content.contains("name")
-                || manifest_content.contains("version"),
-            "Manifest should contain typical extension fields"
-        );
-
-        println!(
-            "Manifest content preview: {}",
-            &manifest_content.chars().take(200).collect::<String>()
-        );
-    }
-
-    // Check for other common extension files
-    let common_files = [
-        "background.js",
-        "content.js",
-        "popup.html",
-        "options.html",
-        "icon.png",
-    ];
-    for file_name in &common_files {
-        let file_path = extract_dir.join(file_name);
-        if file_path.exists() {
-            println!("Found common extension file: {}", file_name);
-        }
-    }
-}
-
-#[test]
-fn test_extraction_preserves_file_permissions() {
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-    let file_path = current_dir.join("src/mock/test-extension.crx");
-
-    let data = fs::read(&file_path).expect("Failed to read CRX file");
-    let extension = parse_crx(&data).expect("Failed to parse CRX file");
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let extract_dir = temp_dir.path().join("permissions-test");
-
-    extract_zip_to_directory(&extension.zip, &extract_dir).expect("Failed to extract ZIP contents");
-
-    // Verify all extracted files are readable
-    fn check_file_permissions(dir: &std::path::Path) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.is_file() {
-                        // Verify we can read the file
-                        assert!(
-                            fs::read(&path).is_ok(),
-                            "Should be able to read extracted file: {}",
-                            path.display()
-                        );
-                    } else if path.is_dir() {
-                        check_file_permissions(&path);
-                    }
-                }
-            }
-        }
-    }
-
-    check_file_permissions(&extract_dir);
-}
-
-#[test]
-fn test_multiple_extractions_to_different_directories() {
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-    let file_path = current_dir.join("src/mock/test-extension.crx");
-
-    let data = fs::read(&file_path).expect("Failed to read CRX file");
-    let extension = parse_crx(&data).expect("Failed to parse CRX file");
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-
-    // Extract to multiple different directories
-    let extract_dirs = [
-        temp_dir.path().join("extraction1"),
-        temp_dir.path().join("extraction2"),
-        temp_dir.path().join("nested/extraction3"),
-    ];
-
-    for extract_dir in &extract_dirs {
-        extract_zip_to_directory(&extension.zip, extract_dir)
-            .expect("Failed to extract ZIP contents");
-
-        assert!(
-            extract_dir.exists(),
-            "Extraction directory should exist: {}",
-            extract_dir.display()
-        );
-
-        let entries: Vec<_> = fs::read_dir(extract_dir)
-            .expect("Should be able to read extraction directory")
-            .collect();
-
-        assert!(
-            !entries.is_empty(),
-            "Should have extracted files to: {}",
-            extract_dir.display()
-        );
-    }
-
-    // Verify all extractions are identical
-    let entries1: Vec<_> = collect_all_files(&extract_dirs[0]);
-    let entries2: Vec<_> = collect_all_files(&extract_dirs[1]);
-    let entries3: Vec<_> = collect_all_files(&extract_dirs[2]);
-
+fn extracts_real_fixture_and_nested_empty_directories() {
+    let root = tempdir().unwrap();
+    let destination = root.path().join("extension");
+    extract_crx_file(
+        std::path::Path::new("src/mock/test-extension.crx"),
+        &destination,
+        &ExtractionOptions::default(),
+    )
+    .unwrap();
+    assert!(destination.join("manifest.json").is_file());
+    let zip = common::zip(&[("nested/empty/", b""), ("nested/file.txt", b"hello")]);
+    let destination = root.path().join("synthetic");
+    extract_zip_to_directory(&zip, &destination, &ExtractionOptions::default()).unwrap();
+    assert!(destination.join("nested/empty").is_dir());
     assert_eq!(
-        entries1.len(),
-        entries2.len(),
-        "All extractions should have same number of files"
-    );
-    assert_eq!(
-        entries1.len(),
-        entries3.len(),
-        "All extractions should have same number of files"
+        fs::read(destination.join("nested/file.txt")).unwrap(),
+        b"hello"
     );
 }
 
 #[test]
-fn test_overwrite_existing_extraction() {
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-    let file_path = current_dir.join("src/mock/test-extension.crx");
+fn overwrite_is_explicit_and_corruption_preserves_previous_data() {
+    let root = tempdir().unwrap();
+    let dest = root.path().join("extension");
+    fs::create_dir(&dest).unwrap();
+    fs::write(dest.join("keep"), b"valuable").unwrap();
+    let valid = common::zip(&[("new", b"unique-payload")]);
+    assert!(extract_zip_to_directory(&valid, &dest, &ExtractionOptions::default()).is_err());
+    let overwrite = ExtractionOptions {
+        overwrite: true,
+        ..Default::default()
+    };
+    let mut corrupt = valid.clone();
+    let pos = corrupt
+        .windows(b"unique-payload".len())
+        .position(|s| s == b"unique-payload")
+        .unwrap();
+    corrupt[pos] ^= 1;
+    for data in [b"invalid zip".as_slice(), corrupt.as_slice()] {
+        assert!(extract_zip_to_directory(data, &dest, &overwrite).is_err());
+        assert_eq!(fs::read(dest.join("keep")).unwrap(), b"valuable");
+        assert!(!dest.join("new").exists());
+    }
+    extract_zip_to_directory(&valid, &dest, &overwrite).unwrap();
+    assert!(!dest.join("keep").exists());
+    assert_eq!(fs::read(dest.join("new")).unwrap(), b"unique-payload");
+}
 
-    let data = fs::read(&file_path).expect("Failed to read CRX file");
-    let extension = parse_crx(&data).expect("Failed to parse CRX file");
+#[test]
+fn enforces_entry_total_count_input_and_time_limits_without_publishing() {
+    let root = tempdir().unwrap();
+    let zip = common::zip(&[("one", b"12345"), ("two", b"67890")]);
+    let limits = [
+        ExtractionOptions {
+            max_entry_bytes: 4,
+            ..Default::default()
+        },
+        ExtractionOptions {
+            max_total_bytes: 9,
+            ..Default::default()
+        },
+        ExtractionOptions {
+            max_entries: 1,
+            ..Default::default()
+        },
+        ExtractionOptions {
+            max_input_bytes: 1,
+            ..Default::default()
+        },
+        ExtractionOptions {
+            max_duration: Duration::ZERO,
+            ..Default::default()
+        },
+    ];
+    for options in limits {
+        let dest = root.path().join("out");
+        assert!(extract_zip_to_directory(&zip, &dest, &options).is_err());
+        assert!(!dest.exists());
+    }
+    let exact = ExtractionOptions {
+        max_entry_bytes: 5,
+        max_total_bytes: 10,
+        max_entries: 2,
+        ..Default::default()
+    };
+    extract_zip_to_directory(&zip, &root.path().join("exact"), &exact).unwrap();
+}
 
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let extract_dir = temp_dir.path().join("overwrite-test");
+#[test]
+fn unsafe_paths_and_file_directory_collisions_fail() {
+    let root = tempdir().unwrap();
+    for name in [
+        "../escape",
+        "/absolute",
+        "a/../../escape",
+        "C:/drive",
+        "a\\escape",
+        "NUL.txt",
+        "a/../b",
+        "trailing.",
+    ] {
+        let zip = common::zip(&[(name, b"bad")]);
+        let dest = root.path().join("out");
+        assert!(
+            extract_zip_to_directory(&zip, &dest, &ExtractionOptions::default()).is_err(),
+            "{name}"
+        );
+        assert!(!dest.exists());
+    }
+    let zip = common::zip(&[("a", b"file"), ("a/b", b"child")]);
+    assert!(extract_zip_to_directory(
+        &zip,
+        &root.path().join("out"),
+        &ExtractionOptions::default()
+    )
+    .is_err());
+}
 
-    // First extraction
-    extract_zip_to_directory(&extension.zip, &extract_dir)
-        .expect("Failed to extract ZIP contents first time");
+#[test]
+fn cancellation_preserves_destination() {
+    let root = tempdir().unwrap();
+    let dest = root.path().join("out");
+    let input = root.path().join("test.crx");
+    fs::write(
+        &input,
+        common::crx2(b"", b"", &common::zip(&[("a", b"data")])),
+    )
+    .unwrap();
+    assert!(extract_crx_file_cancellable(
+        &input,
+        &dest,
+        &ExtractionOptions::default(),
+        &AtomicBool::new(true)
+    )
+    .is_err());
+    assert!(!dest.exists());
+}
 
-    let first_extraction_files = collect_all_files(&extract_dir);
+#[test]
+fn rejects_zip_symlinks() {
+    let root = tempdir().unwrap();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .add_symlink(
+            "link",
+            "../outside",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    let data = writer.finish().unwrap().into_inner();
+    assert!(extract_zip_to_directory(
+        &data,
+        &root.path().join("out"),
+        &ExtractionOptions::default()
+    )
+    .is_err());
+}
 
-    // Create a dummy file that should be overwritten
-    let dummy_file = extract_dir.join("dummy.txt");
-    fs::write(&dummy_file, "This should be overwritten").expect("Failed to create dummy file");
+#[cfg(unix)]
+#[test]
+fn rejects_existing_destination_symlink_even_with_overwrite() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::write(outside.path().join("keep"), b"safe").unwrap();
+    let dest = root.path().join("link");
+    std::os::unix::fs::symlink(outside.path(), &dest).unwrap();
+    let options = ExtractionOptions {
+        overwrite: true,
+        ..Default::default()
+    };
+    assert!(extract_zip_to_directory(&common::zip(&[("a", b"bad")]), &dest, &options).is_err());
+    assert_eq!(fs::read(outside.path().join("keep")).unwrap(), b"safe");
+}
 
-    // Second extraction (should overwrite)
-    extract_zip_to_directory(&extension.zip, &extract_dir)
-        .expect("Failed to extract ZIP contents second time");
+#[test]
+fn compressed_expansion_is_rejected_before_publication() {
+    use std::io::Write;
+    let root = tempdir().unwrap();
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .start_file(
+            "large",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated),
+        )
+        .unwrap();
+    writer.write_all(&vec![0; 1024 * 1024]).unwrap();
+    let data = writer.finish().unwrap().into_inner();
+    assert!(data.len() < 10_000);
+    let options = ExtractionOptions {
+        max_total_bytes: 4096,
+        ..Default::default()
+    };
+    let destination = root.path().join("out");
+    assert!(extract_zip_to_directory(&data, &destination, &options).is_err());
+    assert!(!destination.exists());
+}
 
-    let second_extraction_files = collect_all_files(&extract_dir);
-
-    // The dummy file should still be there (since we're not removing the directory first)
-    // but the original files should be intact
-    assert!(
-        first_extraction_files.len() <= second_extraction_files.len(),
-        "Second extraction should have at least as many files as first"
+#[test]
+fn concurrent_extraction_is_refused_while_output_parent_is_locked() {
+    use std::fs::OpenOptions;
+    let root = tempdir().unwrap();
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .read(true)
+        .open(root.path().join(".uncrx.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let result = extract_zip_to_directory(
+        &common::zip(&[("a", b"b")]),
+        &root.path().join("out"),
+        &ExtractionOptions::default(),
     );
+    assert!(format!("{:#}", result.unwrap_err()).contains("Another extraction"));
+    assert!(!root.path().join("out").exists());
 }
 
-// Helper function to print directory structure for debugging
-fn print_directory_structure(dir: &std::path::Path, indent: usize) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-
-                println!(
-                    "{}{}{}",
-                    "  ".repeat(indent),
-                    if path.is_dir() { "📁 " } else { "📄 " },
-                    name
-                );
-
-                if path.is_dir() {
-                    print_directory_structure(&path, indent + 1);
-                }
-            }
+#[test]
+fn rejects_duplicate_names_even_when_zip_reader_deduplicates_them() {
+    let mut data = common::zip(&[("a", b"first"), ("b", b"second")]);
+    // Rename b to a in its local header and central directory. Sizes and CRCs
+    // stay valid; only duplicate naming makes this archive unacceptable.
+    for i in 0..data.len().saturating_sub(47) {
+        if data.get(i..i + 4) == Some(b"PK\x03\x04") && data[i + 30] == b'b' {
+            data[i + 30] = b'a';
+        }
+        if data.get(i..i + 4) == Some(b"PK\x01\x02") && data[i + 46] == b'b' {
+            data[i + 46] = b'a';
         }
     }
+    let root = tempdir().unwrap();
+    let error = extract_zip_to_directory(
+        &data,
+        &root.path().join("out"),
+        &ExtractionOptions::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("Duplicate ZIP"));
+    assert!(!root.path().join("out").exists());
 }
 
-// Helper function to collect all files in a directory recursively
-fn collect_all_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-
-    fn walk_dir(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.is_file() {
-                        files.push(path);
-                    } else if path.is_dir() {
-                        walk_dir(&path, files);
-                    }
-                }
-            }
-        }
+#[test]
+fn zip64_end_records_are_supported_and_count_limited() {
+    let mut data = common::zip(&[("file", b"hello")]);
+    let end = data.len() - 22;
+    let mut legacy = data.split_off(end);
+    let size = u32::from_le_bytes(legacy[12..16].try_into().unwrap());
+    let offset = u32::from_le_bytes(legacy[16..20].try_into().unwrap());
+    data.extend(b"PK\x06\x06");
+    data.extend(44u64.to_le_bytes());
+    data.extend(45u16.to_le_bytes());
+    data.extend(45u16.to_le_bytes());
+    data.extend([0; 8]);
+    for n in [1u64, 1, u64::from(size), u64::from(offset)] {
+        data.extend(n.to_le_bytes());
     }
-
-    walk_dir(dir, &mut files);
-    files.sort();
-    files
+    data.extend(b"PK\x06\x07");
+    data.extend([0; 4]);
+    data.extend((end as u64).to_le_bytes());
+    data.extend(1u32.to_le_bytes());
+    legacy[8..20].fill(255);
+    data.extend(legacy);
+    let root = tempdir().unwrap();
+    extract_zip_to_directory(
+        &data,
+        &root.path().join("ok"),
+        &ExtractionOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(fs::read(root.path().join("ok/file")).unwrap(), b"hello");
+    for position in [end + 24, end + 32] {
+        data[position..position + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    }
+    let error = extract_zip_to_directory(
+        &data,
+        &root.path().join("bad"),
+        &ExtractionOptions::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("entry count exceeds limit"));
 }

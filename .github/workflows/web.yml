@@ -1,102 +1,66 @@
-# Workflow to build your docs with oranda (and mdbook)
-# and deploy them to Github Pages
 name: Web
-
-# We're going to push to the gh-pages branch, so we need that permission
-permissions:
-  contents: write
-
-# What situations do we want to build docs in?
-# All of these work independently and can be removed / commented out
-# if you don't want oranda/mdbook running in that situation
 on:
-  # Check that a PR didn't break docs!
-  #
-  # Note that the "Deploy to Github Pages" step won't run in this mode,
-  # so this won't have any side-effects. But it will tell you if a PR
-  # completely broke oranda/mdbook. Sadly we don't provide previews (yet)!
   pull_request:
-
-  # Whenever something gets pushed to main, update the docs!
-  # This is great for getting docs changes live without cutting a full release.
-  #
-  # Note that if you're using cargo-dist, this will "race" the Release workflow
-  # that actually builds the Github Release that oranda tries to read (and
-  # this will almost certainly complete first). As a result you will publish
-  # docs for the latest commit but the oranda landing page won't know about
-  # the latest release. The workflow_run trigger below will properly wait for
-  # cargo-dist, and so this half-published state will only last for ~10 minutes.
-  #
-  # If you only want docs to update with releases, disable this, or change it to
-  # a "release" branch. You can, of course, also manually trigger a workflow run
-  # when you want the docs to update.
   push:
-    branches:
-      - main
-
-  # Whenever a workflow called "Release" completes, update the docs!
-  #
-  # If you're using cargo-dist, this is recommended, as it will ensure that
-  # oranda always sees the latest release right when it's available. Note
-  # however that Github's UI is wonky when you use workflow_run, and won't
-  # show this workflow as part of any commit. You have to go to the "actions"
-  # tab for your repo to see this one running (the gh-pages deploy will also
-  # only show up there).
+    branches: [main]
   workflow_run:
-    workflows: [ "Release" ]
-    types:
-      - completed
-
-# Alright, let's do it!
+    workflows: [Release]
+    types: [completed]
+permissions:
+  contents: read
 jobs:
-  web:
-    name: Build and deploy site and docs
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
-      # Setup
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
-
-      # If you use any mdbook plugins, here's the place to install them!
-
-      # Install and run oranda (and mdbook)
-      # This will write all output to ./public/ (including copying mdbook's output to there)
-      - name: Install and run oranda
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install verified Oranda 0.6.5 and build
+        env:
+          ORANDA_SHA256: 05171447b827f681ec19142d0bb983a8691f65c54820d821e66ee7a419fbd88b
         run: |
-          curl --proto '=https' --tlsv1.2 -LsSf https://github.com/axodotdev/oranda/releases/latest/download/oranda-installer.sh | sh
-          oranda build
-      
+          curl --proto '=https' --tlsv1.2 -fLsS https://github.com/axodotdev/oranda/releases/download/v0.6.5/oranda-x86_64-unknown-linux-musl.tar.gz -o "$RUNNER_TEMP/oranda.tar.gz"
+          echo "$ORANDA_SHA256  $RUNNER_TEMP/oranda.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/oranda.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/oranda-x86_64-unknown-linux-musl/oranda" build
       - name: Prepare HTML for link checking
-        # untitaker/hyperlink supports no site prefixes, move entire site into
-        # a subfolder
         run: |
-          mkdir /tmp/public/ && cp -R public /tmp/public/uncrx-rs
+          mkdir /tmp/public/
+          cp -R public /tmp/public/uncrx-rs
           cp LICENSE /tmp/public/
           cp LICENSE /tmp/public/uncrx-rs/
-          cp public/index.html /tmp/public
-
-      - name: Check HTML for broken internal links
-        uses: untitaker/hyperlink@0.1.29
+          cp public/index.html /tmp/public/
+      - uses: untitaker/hyperlink@9375bc4063712ad490d5eb3d54df0b6aade15e54 # 0.3.2
         with:
           args: /tmp/public/
-      
-      # Deploy to our gh-pages branch (creating it if it doesn't exist)
-      # the "public" dir that oranda made above will become the root dir
-      # of this branch.
-      #
-      # Note that once the gh-pages branch exists, you must
-      # go into repo's settings > pages and set "deploy from branch: gh-pages"
-      # the other defaults work fine.
-      - name: Deploy to Github Pages
-        uses: JamesIves/github-pages-deploy-action@v4
-        # ONLY if we're on main (so no PRs or feature branches allowed!)
-        if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: website
+          path: public/
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: website
+          path: public/
+      - uses: JamesIves/github-pages-deploy-action@fa24774553152dd7873cd16ebd8d959b010c5445 # v4.9.0
         with:
           branch: gh-pages
-          # Gotta tell the action where to find oranda's output
           folder: public
           token: ${{ secrets.GITHUB_TOKEN }}
           single-commit: true

@@ -1,220 +1,83 @@
-use std::{env, fs};
-use tempfile::TempDir;
-use uncrx_rs::uncrx::helpers::parse_crx;
-use zip::ZipArchive;
+#![cfg(feature = "cli")]
+mod common;
+use std::{
+    fs,
+    process::{Command, Output},
+};
+use tempfile::tempdir;
 
-fn extract_zip_to_directory(
-    zip_data: &[u8],
-    extract_to: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cursor = std::io::Cursor::new(zip_data);
-    let mut archive = ZipArchive::new(cursor)?;
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => extract_to.join(path),
-            None => continue,
-        };
-
-        if file.name().ends_with('/') {
-            // Directory
-            fs::create_dir_all(&outpath)?;
-        } else {
-            // File
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p)?;
-                }
-            }
-            let mut outfile = fs::File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)?;
-        }
-    }
-
-    Ok(())
+fn run(root: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_uncrx"))
+        .current_dir(root)
+        .args(args)
+        .output()
+        .unwrap()
 }
 
 #[test]
-fn test_cli_extraction_workflow() {
-    // Simulate the CLI workflow from main.rs
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-    let crx_file_path = current_dir.join("src/mock/test-extension.crx");
-
-    // Ensure file exists
-    assert!(crx_file_path.exists(), "Test CRX file should exist");
-
-    // Read and parse CRX (same as CLI does)
-    let data = fs::read(&crx_file_path).expect("Failed to read file");
-    let extension = parse_crx(&data).expect("Failed to parse crx");
-
-    // Create output directory structure like CLI does
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let output_base_dir = temp_dir.path().join("out");
-
-    if !output_base_dir.exists() {
-        fs::create_dir_all(&output_base_dir).expect("Failed to create base output directory");
-    }
-
-    // Create directory with same name as CRX file (without extension)
-    let crx_name = crx_file_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("extension");
-
-    let extract_dir = output_base_dir.join(crx_name);
-
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir).expect("Failed to remove existing directory");
-    }
-
-    fs::create_dir_all(&extract_dir).expect("Failed to create extraction directory");
-
-    // Extract zip contents to the directory
-    extract_zip_to_directory(&extension.zip, &extract_dir).expect("Failed to extract zip contents");
-
-    // Verify the extraction worked
-    assert!(extract_dir.exists(), "Extraction directory should exist");
+fn real_cli_extracts_and_requires_explicit_overwrite() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("test.crx"),
+        common::crx2(b"", b"", &common::zip(&[("nested/file", b"hello")])),
+    )
+    .unwrap();
+    let first = run(root.path(), &["test.crx", "-o", "custom"]);
+    assert!(first.status.success(), "{:?}", first);
     assert_eq!(
-        extract_dir.file_name().unwrap(),
-        crx_name,
-        "Directory should have same name as CRX file"
+        fs::read(root.path().join("custom/test/nested/file")).unwrap(),
+        b"hello"
     );
-
-    // Verify files were extracted
-    let extracted_files: Vec<_> = fs::read_dir(&extract_dir)
-        .expect("Should be able to read extraction directory")
-        .collect();
-
-    assert!(!extracted_files.is_empty(), "Should have extracted files");
-
-    println!("CLI extraction successful: {}", extract_dir.display());
+    fs::write(root.path().join("custom/test/keep"), b"old").unwrap();
+    assert!(!run(root.path(), &["test.crx", "-o", "custom"])
+        .status
+        .success());
+    assert!(root.path().join("custom/test/keep").exists());
+    assert!(
+        run(root.path(), &["test.crx", "-o", "custom", "--overwrite"])
+            .status
+            .success()
+    );
+    assert!(!root.path().join("custom/test/keep").exists());
 }
 
 #[test]
-fn test_tui_extraction_workflow() {
-    // Simulate the TUI workflow from tui_app.rs
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-    let crx_file_path = current_dir.join("src/mock/test-extension.crx");
-
-    // TUI workflow (similar to convert_crx_file method)
-    let data = fs::read(&crx_file_path).expect("Failed to read file");
-    let extension = parse_crx(&data).expect("Failed to parse crx");
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-    let output_dir = temp_dir.path().join("out");
-
-    if !output_dir.exists() {
-        fs::create_dir_all(&output_dir).expect("Failed to create output directory");
+fn real_cli_reports_malformed_input_without_panicking_or_losing_data() {
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("out/test")).unwrap();
+    fs::write(root.path().join("out/test/keep"), b"old").unwrap();
+    for bytes in [
+        b"Cr24\x02\0\0\0\xff\xff\xff\xff".to_vec(),
+        common::crx2(b"", b"", b"broken ZIP"),
+    ] {
+        fs::write(root.path().join("test.crx"), bytes).unwrap();
+        let result = run(root.path(), &["test.crx", "--overwrite"]);
+        assert_eq!(result.status.code(), Some(1));
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("panicked"));
+        assert_eq!(fs::read(root.path().join("out/test/keep")).unwrap(), b"old");
     }
-
-    let file_name = crx_file_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("extension");
-
-    let extract_dir = output_dir.join(file_name);
-
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir).expect("Failed to remove existing directory");
-    }
-
-    fs::create_dir_all(&extract_dir).expect("Failed to create extraction directory");
-
-    // Extract zip contents to the directory
-    extract_zip_to_directory(&extension.zip, &extract_dir).expect("Failed to extract zip contents");
-
-    // Verify the extraction worked
-    assert!(
-        extract_dir.exists(),
-        "TUI extraction directory should exist"
-    );
-
-    let extracted_files: Vec<_> = fs::read_dir(&extract_dir)
-        .expect("Should be able to read extraction directory")
-        .collect();
-
-    assert!(
-        !extracted_files.is_empty(),
-        "TUI should have extracted files"
-    );
-
-    println!("TUI extraction successful: {}", extract_dir.display());
 }
 
 #[test]
-fn test_cli_and_tui_produce_identical_results() {
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-    let crx_file_path = current_dir.join("src/mock/test-extension.crx");
-
-    let data = fs::read(&crx_file_path).expect("Failed to read file");
-    let extension = parse_crx(&data).expect("Failed to parse crx");
-
-    let temp_dir = TempDir::new().expect("Failed to create temp directory");
-
-    // CLI-style extraction
-    let cli_extract_dir = temp_dir.path().join("cli_extraction");
-    fs::create_dir_all(&cli_extract_dir).expect("Failed to create CLI extraction directory");
-    extract_zip_to_directory(&extension.zip, &cli_extract_dir)
-        .expect("Failed to extract with CLI method");
-
-    // TUI-style extraction
-    let tui_extract_dir = temp_dir.path().join("tui_extraction");
-    fs::create_dir_all(&tui_extract_dir).expect("Failed to create TUI extraction directory");
-    extract_zip_to_directory(&extension.zip, &tui_extract_dir)
-        .expect("Failed to extract with TUI method");
-
-    // Compare the results
-    fn collect_files_with_content(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
-        let mut files = Vec::new();
-
-        fn walk_dir(
-            dir: &std::path::Path,
-            base: &std::path::Path,
-            files: &mut Vec<(String, Vec<u8>)>,
-        ) {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let path = entry.path();
-                        if path.is_file() {
-                            let relative_path = path
-                                .strip_prefix(base)
-                                .unwrap()
-                                .to_string_lossy()
-                                .to_string();
-                            let content = fs::read(&path).expect("Should be able to read file");
-                            files.push((relative_path, content));
-                        } else if path.is_dir() {
-                            walk_dir(&path, base, files);
-                        }
-                    }
-                }
-            }
-        }
-
-        walk_dir(dir, dir, &mut files);
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        files
+fn real_cli_applies_limits_and_reports_package_version() {
+    let root = tempdir().unwrap();
+    fs::write(
+        root.path().join("test.crx"),
+        common::crx2(b"", b"", &common::zip(&[("file", b"hello")])),
+    )
+    .unwrap();
+    for args in [
+        vec!["--max-entry-bytes", "4"],
+        vec!["--max-total-bytes", "4"],
+        vec!["--max-entries", "0"],
+        vec!["--max-input-bytes", "1"],
+        vec!["--timeout-seconds", "0"],
+    ] {
+        let mut cmd = vec!["test.crx"];
+        cmd.extend(args);
+        assert_eq!(run(root.path(), &cmd).status.code(), Some(1));
+        assert!(!root.path().join("out/test").exists());
     }
-
-    let cli_files = collect_files_with_content(&cli_extract_dir);
-    let tui_files = collect_files_with_content(&tui_extract_dir);
-
-    assert_eq!(
-        cli_files.len(),
-        tui_files.len(),
-        "CLI and TUI should extract same number of files"
-    );
-
-    for (cli_file, tui_file) in cli_files.iter().zip(tui_files.iter()) {
-        assert_eq!(cli_file.0, tui_file.0, "File names should match");
-        assert_eq!(
-            cli_file.1, tui_file.1,
-            "File contents should match for {}",
-            cli_file.0
-        );
-    }
-
-    println!("CLI and TUI extraction methods produce identical results!");
+    let version = run(root.path(), &["--version"]);
+    assert!(String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")));
 }

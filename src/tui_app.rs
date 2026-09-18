@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
@@ -14,42 +15,15 @@ use ratatui::{
 use std::{
     env, fs,
     io::{self, Stdout},
-    path::{Path, PathBuf},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread::JoinHandle,
+    time::Duration,
 };
-use uncrx_rs::uncrx::helpers::parse_crx;
-use zip::ZipArchive;
-
-fn extract_zip_to_directory(
-    zip_data: &[u8],
-    extract_to: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cursor = std::io::Cursor::new(zip_data);
-    let mut archive = ZipArchive::new(cursor)?;
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => extract_to.join(path),
-            None => continue,
-        };
-
-        if file.name().ends_with('/') {
-            // Directory
-            fs::create_dir_all(&outpath)?;
-        } else {
-            // File
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p)?;
-                }
-            }
-            let mut outfile = fs::File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)?;
-        }
-    }
-
-    Ok(())
-}
+use uncrx_rs::extract::{extract_crx_file_cancellable, ExtractionOptions};
 
 #[derive(Debug, Clone)]
 enum AppState {
@@ -97,19 +71,22 @@ struct App {
     selected_item: ListState,
     current_dir: PathBuf,
     output_dir: PathBuf,
+    options: ExtractionOptions,
+    worker: Option<JoinHandle<Result<PathBuf>>>,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl App {
-    fn new() -> Result<App, Box<dyn std::error::Error>> {
-        let current_dir = env::current_dir()?;
-        let output_dir = current_dir.join("out");
-
+    fn new(current_dir: PathBuf, output_dir: PathBuf, options: ExtractionOptions) -> Result<App> {
         let mut app = App {
             state: AppState::FileBrowser,
             items: Vec::new(),
             selected_item: ListState::default(),
             current_dir: current_dir.clone(),
             output_dir,
+            options,
+            worker: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
 
         app.refresh_items()?;
@@ -120,7 +97,7 @@ impl App {
         Ok(app)
     }
 
-    fn refresh_items(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn refresh_items(&mut self) -> Result<()> {
         self.items.clear();
 
         // Add parent directory entry if not at root
@@ -204,7 +181,7 @@ impl App {
         self.selected_item.select(Some(i));
     }
 
-    fn handle_enter(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn handle_enter(&mut self) -> Result<()> {
         if let Some(selected) = self.selected_item.selected() {
             if selected < self.items.len() {
                 match &self.items[selected] {
@@ -214,15 +191,7 @@ impl App {
                         self.selected_item.select(Some(0));
                     }
                     FileSystemItem::CrxFile(path) => {
-                        self.state = AppState::Processing;
-                        match self.convert_crx_file(path) {
-                            Ok(output_path) => {
-                                self.state = AppState::Success(output_path);
-                            }
-                            Err(e) => {
-                                self.state = AppState::Error(e.to_string());
-                            }
-                        }
+                        self.start_extraction(path.clone())?;
                     }
                     FileSystemItem::ParentDirectory => {
                         if let Some(parent) = self.current_dir.parent() {
@@ -237,31 +206,43 @@ impl App {
         Ok(())
     }
 
-    fn convert_crx_file(&self, crx_path: &PathBuf) -> Result<String, Box<dyn std::error::Error>> {
-        let data = fs::read(crx_path)?;
-        let extension = parse_crx(&data)?;
+    fn start_extraction(&mut self, path: PathBuf) -> Result<()> {
+        let name = path.file_stem().context("Missing filename")?;
+        anyhow::ensure!(
+            name != "." && name != "..",
+            "Invalid extraction directory name"
+        );
+        let destination = self.output_dir.join(name);
+        let options = self.options.clone();
+        self.cancelled.store(false, Ordering::Relaxed);
+        let cancelled = Arc::clone(&self.cancelled);
+        self.worker = Some(
+            std::thread::Builder::new()
+                .name("crx-extract".into())
+                .spawn(move || {
+                    extract_crx_file_cancellable(&path, &destination, &options, &cancelled)?;
+                    Ok(destination)
+                })?,
+        );
+        self.state = AppState::Processing;
+        Ok(())
+    }
 
-        if !self.output_dir.exists() {
-            fs::create_dir_all(&self.output_dir)?;
+    fn poll_worker(&mut self) {
+        if !self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+        {
+            return;
         }
-
-        let file_name = crx_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("extension");
-
-        let extract_dir = self.output_dir.join(file_name);
-
-        if extract_dir.exists() {
-            fs::remove_dir_all(&extract_dir)?;
+        if let Some(worker) = self.worker.take() {
+            self.state = match worker.join() {
+                Ok(Ok(path)) => AppState::Success(path.display().to_string()),
+                Ok(Err(error)) => AppState::Error(format!("{error:#}")),
+                Err(_) => AppState::Error("Extraction worker panicked".into()),
+            };
         }
-
-        fs::create_dir_all(&extract_dir)?;
-
-        // Extract zip contents to the directory
-        extract_zip_to_directory(&extension.zip, &extract_dir)?;
-
-        Ok(extract_dir.to_string_lossy().to_string())
     }
 
     fn reset_to_browser(&mut self) {
@@ -269,41 +250,50 @@ impl App {
     }
 }
 
-pub fn run_tui() -> Result<(), Box<dyn std::error::Error>> {
-    // Setup terminal
+impl Drop for App {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        // Each restoration is attempted even if another one fails.
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::Show
+        );
+    }
+}
+
+pub fn run_tui(output_dir: PathBuf, options: ExtractionOptions) -> Result<()> {
+    let current_dir = env::current_dir()?;
+    let mut app = App::new(current_dir.clone(), current_dir.join(output_dir), options)?;
+    // Install before setup so partial initialization and unwinding also restore.
+    let _guard = TerminalGuard;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    // Create app and run it
-    let mut app = App::new()?;
-    let res = run_app(&mut terminal, &mut app);
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    if let Err(err) = res {
-        println!("{err:?}");
-    }
-
-    Ok(())
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    run_app(&mut terminal, &mut app)
 }
 
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        app.poll_worker();
         terminal.draw(|f| ui(f, app))?;
 
+        if !event::poll(Duration::from_millis(50))? {
+            continue;
+        }
         if let Event::Key(key) = event::read()? {
             if key.kind == KeyEventKind::Press {
                 match &app.state {
@@ -323,7 +313,9 @@ fn run_app(
                         _ => {}
                     },
                     AppState::Processing => {
-                        // Wait for processing to complete
+                        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                            return Ok(());
+                        }
                     }
                     AppState::Success(_) | AppState::Error(_) => match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
@@ -336,7 +328,7 @@ fn run_app(
     }
 }
 
-fn ui(f: &mut Frame, app: &App) {
+fn ui(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -360,7 +352,7 @@ fn ui(f: &mut Frame, app: &App) {
     // Footer with instructions
     let instructions = match &app.state {
         AppState::FileBrowser => "↑/↓: Navigate | Enter: Open/Extract | R: Refresh | Q/Esc: Quit",
-        AppState::Processing => "Processing...",
+        AppState::Processing => "Processing... | Q/Esc: Cancel and quit",
         AppState::Success(_) | AppState::Error(_) => {
             "Enter/Space: Back to file browser | Q/Esc: Quit"
         }
@@ -389,7 +381,7 @@ fn ui(f: &mut Frame, app: &App) {
     }
 }
 
-fn render_file_browser(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
+fn render_file_browser(f: &mut Frame, area: ratatui::layout::Rect, app: &mut App) {
     let current_dir_display = app.current_dir.to_string_lossy();
     let title = format!("File Browser - {}", current_dir_display);
 
@@ -432,7 +424,7 @@ fn render_file_browser(f: &mut Frame, area: ratatui::layout::Rect, app: &App) {
             .block(block)
             .highlight_style(Style::default().fg(Color::Black).bg(Color::White));
 
-        f.render_stateful_widget(items_list, area, &mut app.selected_item.clone());
+        f.render_stateful_widget(items_list, area, &mut app.selected_item);
     }
 }
 
@@ -473,4 +465,74 @@ fn render_error(f: &mut Frame, area: ratatui::layout::Rect, error_msg: &str) {
         .block(Block::default().title("Error").borders(Borders::ALL));
 
     f.render_widget(error, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use std::time::Instant;
+
+    #[test]
+    fn browser_runs_real_worker_and_renders_processing_and_result() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("fixture.crx");
+        fs::write(&input, include_bytes!("mock/test-extension.crx")).unwrap();
+        let mut app = App::new(
+            root.path().to_path_buf(),
+            root.path().join("out"),
+            ExtractionOptions::default(),
+        )
+        .unwrap();
+        let index = app
+            .items
+            .iter()
+            .position(|item| matches!(item, FileSystemItem::CrxFile(_)))
+            .unwrap();
+        app.selected_item.select(Some(index));
+        app.handle_enter().unwrap();
+        assert!(matches!(app.state, AppState::Processing));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+        let start = Instant::now();
+        while matches!(app.state, AppState::Processing) {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            app.poll_worker();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(app.state, AppState::Success(_)), "{:?}", app.state);
+        assert!(root.path().join("out/fixture/manifest.json").exists());
+        // Same real handler must refuse overwriting an existing extraction.
+        app.reset_to_browser();
+        app.handle_enter().unwrap();
+        while matches!(app.state, AppState::Processing) {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            app.poll_worker();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(app.state, AppState::Error(ref message) if message.contains("already exists"))
+        );
+    }
+
+    #[test]
+    fn dropping_app_cancels_and_joins_worker() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::new(
+            root.path().to_path_buf(),
+            root.path().join("out"),
+            ExtractionOptions::default(),
+        )
+        .unwrap();
+        let flag = Arc::clone(&app.cancelled);
+        let worker_flag = Arc::clone(&flag);
+        app.worker = Some(std::thread::spawn(move || {
+            while !worker_flag.load(Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            anyhow::bail!("cancelled")
+        }));
+        drop(app);
+        assert!(flag.load(Ordering::Relaxed));
+    }
 }
