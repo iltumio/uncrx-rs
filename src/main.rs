@@ -1,122 +1,73 @@
-pub mod cli;
+#[cfg(feature = "tui")]
 mod tui_app;
 
+use anyhow::{Context, Result};
 use clap::Parser;
-use cli::{errors::UncrxCliError, helpers::exit_with_error};
-use std::{env, fs, path::Path};
-use uncrx_rs::uncrx::helpers::parse_crx;
-use zip::ZipArchive;
+use std::{path::PathBuf, time::Duration};
+use uncrx_rs::extract::{extract_crx_file, ExtractionOptions};
 
 #[derive(Parser)]
-#[command(name = "uncrx-rs")]
-#[command(author = "Manuel Tumiati <tumiatimanuel@gmail.com>")]
-#[command(version = "1.0")]
-#[command(about = "Easily convert a CRX Extension to a zip file", long_about = None)]
-#[command(next_line_help = true)]
+#[command(
+    name = "uncrx",
+    version,
+    about = "Extract CRX2/CRX3 archives (signatures are not verified)"
+)]
 struct Cli {
-    /// CRX file to convert
-    filename: String,
-    #[arg(short, long)]
-    output_dir: Option<String>,
+    /// CRX file to extract. With no filename, launch the TUI when enabled.
+    filename: Option<PathBuf>,
+    #[arg(short, long, default_value = "out")]
+    output_dir: PathBuf,
+    /// Replace an existing extraction only after the new one succeeds.
+    #[arg(long)]
+    overwrite: bool,
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    max_input_bytes: u64,
+    #[arg(long, default_value_t = 256 * 1024 * 1024)]
+    max_entry_bytes: u64,
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    max_total_bytes: u64,
+    #[arg(long, default_value_t = 10_000)]
+    max_entries: usize,
+    #[arg(long, default_value_t = 120)]
+    timeout_seconds: u64,
 }
 
-fn extract_zip_to_directory(
-    zip_data: &[u8],
-    extract_to: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let cursor = std::io::Cursor::new(zip_data);
-    let mut archive = ZipArchive::new(cursor)?;
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let outpath = match file.enclosed_name() {
-            Some(path) => extract_to.join(path),
-            None => continue,
-        };
-
-        if file.name().ends_with('/') {
-            // Directory
-            fs::create_dir_all(&outpath)?;
-        } else {
-            // File
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(p)?;
-                }
-            }
-            let mut outfile = fs::File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)?;
-        }
-    }
-
+fn run(cli: Cli) -> Result<()> {
+    let options = ExtractionOptions {
+        overwrite: cli.overwrite,
+        max_input_bytes: cli.max_input_bytes,
+        max_entry_bytes: cli.max_entry_bytes,
+        max_total_bytes: cli.max_total_bytes,
+        max_entries: cli.max_entries,
+        max_duration: Duration::from_secs(cli.timeout_seconds),
+    };
+    let Some(input) = cli.filename else {
+        #[cfg(feature = "tui")]
+        return tui_app::run_tui(cli.output_dir, options);
+        #[cfg(not(feature = "tui"))]
+        anyhow::bail!("A CRX filename is required (TUI support is disabled)");
+    };
+    let name = input.file_stem().context("Input must have a filename")?;
+    anyhow::ensure!(
+        name != "." && name != "..",
+        "Invalid extraction directory name"
+    );
+    let destination = cli.output_dir.join(name);
+    extract_crx_file(&input, &destination, &options)?;
+    println!(
+        "Successfully extracted {} to {}",
+        input.display(),
+        destination.display()
+    );
     Ok(())
 }
 
-pub fn main() {
-    // If no arguments provided, launch TUI mode
-    if env::args().len() == 1 {
-        if let Err(err) = tui_app::run_tui() {
-            eprintln!("TUI Error: {}", err);
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    // CLI mode - parse arguments and process
-    let cli = Cli::parse();
-    let filename = cli.filename;
-
-    // CLI mode - process the provided file
-    match filename.ends_with(".crx") {
-        true => {}
-        false => {
-            exit_with_error(UncrxCliError::UnsupportedFileType);
+fn main() -> std::process::ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            std::process::ExitCode::FAILURE
         }
     }
-
-    let current_dir = env::current_dir().expect("Failed to get current directory");
-
-    let crx_file_path = current_dir.join(&filename);
-
-    if !crx_file_path.exists() {
-        exit_with_error(UncrxCliError::NotFound(
-            crx_file_path.to_str().unwrap().to_string(),
-        ));
-    }
-
-    let data = fs::read(crx_file_path.to_str().unwrap()).expect("Failed to read file");
-
-    let extension = parse_crx(&data).expect("Failed to parse crx");
-
-    let output_base_dir = match cli.output_dir {
-        Some(path) => current_dir.join(path),
-        None => current_dir.join("out"),
-    };
-
-    if !output_base_dir.exists() {
-        fs::create_dir_all(&output_base_dir).expect("Failed to create base output directory");
-    }
-
-    // Create a directory with the same name as the CRX file (without extension)
-    let crx_name = crx_file_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("extension");
-
-    let extract_dir = output_base_dir.join(crx_name);
-
-    if extract_dir.exists() {
-        fs::remove_dir_all(&extract_dir).expect("Failed to remove existing directory");
-    }
-
-    fs::create_dir_all(&extract_dir).expect("Failed to create extraction directory");
-
-    // Extract zip contents to the directory
-    extract_zip_to_directory(&extension.zip, &extract_dir).expect("Failed to extract zip contents");
-
-    println!(
-        "Successfully extracted {} to {}",
-        filename,
-        extract_dir.display()
-    );
 }
