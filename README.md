@@ -37,7 +37,7 @@ Add `uncrx-rs` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-uncrx-rs = "0.2.3"
+uncrx-rs = "0.3.0"
 ```
 
 Or use `cargo add`:
@@ -202,7 +202,7 @@ parser-only dependency without terminal or ZIP extraction dependencies:
 
 ```toml
 [dependencies]
-uncrx-rs = { version = "0.2.3", default-features = false }
+uncrx-rs = { version = "0.3.0", default-features = false }
 ```
 
 Enable the `extract` feature for `uncrx_rs::extract::{extract_crx_file,
