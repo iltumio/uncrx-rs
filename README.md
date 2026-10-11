@@ -1,13 +1,17 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/iltumio/uncrx-rs/main/assets/logo.png" alt="Uncrx-rs logo: an open extension archive" width="180" />
+</p>
+
 # Uncrx-rs
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Crates.io Version](https://img.shields.io/crates/v/uncrx-rs)](https://crates.io/crates/uncrx-rs)
 
-A Rust library and command-line tool for converting Chrome CRX extension files to ZIP archives that can be easily extracted.
+A Rust library, CLI, and interactive TUI for parsing Chrome CRX2/CRX3 extensions, accessing their ZIP payloads, and extracting their contents.
 
 ## Description
 
-Uncrx-rs provides both a library and a CLI tool to help you convert CRX (Chrome Extension) files to ZIP format. CRX files are Chrome's packaged extension format, which contains a header with metadata and a ZIP archive. This tool extracts the ZIP portion, making it easy to inspect, modify, or extract Chrome extensions.
+Uncrx-rs opens Chrome's packaged extension format, which combines a CRX header with a ZIP archive. Use the Rust API to read metadata and access the embedded ZIP payload, the CLI to extract an extension, or the interactive TUI to browse and unpack CRX files. Extraction includes configurable resource limits and checks for unsafe archive paths.
 
 ## Features
 
