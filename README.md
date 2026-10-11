@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Uncrx-rs logo: an open extension archive" width="180" />
+  <img src="https://raw.githubusercontent.com/iltumio/uncrx-rs/main/assets/logo.png" alt="Uncrx-rs logo: an open extension archive" width="180" />
 </p>
 
 # Uncrx-rs
